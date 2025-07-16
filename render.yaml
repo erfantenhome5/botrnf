@@ -1,0 +1,29 @@
+# render.yaml
+services:
+  - type: worker # Use 'worker' for a background script that doesn't need a public URL
+    name: telegram-group-bot
+    env: python
+    plan: free # Specifies the free instance type
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py" # Assumes your script is named main.py
+    disks:
+      - name: sessions-data # A name for your persistent disk
+        mountPath: /app/sessions # Mounts the disk at the 'sessions' directory
+        sizeGB: 1 # 1 GB is the minimum and more than enough
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.4 # Specify a recent Python version
+      - key: API_ID
+        sync: false # Set these secrets in the Render dashboard
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: MASTER_PASSWORD_HASH
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

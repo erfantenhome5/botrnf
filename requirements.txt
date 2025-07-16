@@ -1,0 +1,5 @@
+telethon
+httpx
+sentry-sdk
+cryptography
+python-dotenv
