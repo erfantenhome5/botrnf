@@ -110,6 +110,7 @@ class Config:
     BTN_STOP_PREFIX = "⏹️ توقف برای"
     BTN_DELETE_PREFIX = "🗑️ حذف"
     BTN_SET_KEYWORDS = "📝 تنظیم کلمات کلیدی AI"
+    BTN_SET_CONVERSATION_ACCOUNTS = "🗣️ تنظیم حساب‌های گفتگو"
 
     # --- Messages (All in Persian) ---
     MSG_WELCOME = "**🤖 به ربات سازنده گروه خوش آمدید!**"
@@ -126,6 +127,8 @@ class Config:
         f"  - `{BTN_DELETE_PREFIX} [نام حساب]`: یک حساب و تمام اطلاعات آن را برای همیشه حذف می‌کند.\n\n"
         f"**{BTN_SET_KEYWORDS}**\n"
         "کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی تنظیم کنید.\n\n"
+        f"**{BTN_SET_CONVERSATION_ACCOUNTS}**\n"
+        "حساب‌هایی که باید در گروه‌های جدید به گفتگو بپردازند را مشخص کنید.\n\n"
         f"**{BTN_SERVER_STATUS}**\n"
         "این گزینه اطلاعات لحظه‌ای درباره وضعیت ربات را نمایش می‌دهد."
     )
@@ -134,6 +137,8 @@ class Config:
     MSG_BROWSER_RUNNING = "⏳ در حال آماده‌سازی مرورگر امن... این کار ممکن است چند لحظه طول بکشد."
     MSG_PROMPT_KEYWORDS = "📝 لطفاً کلمات کلیدی مورد نظر خود را برای تولید محتوای هوش مصنوعی وارد کنید. کلمات را با کاما (,) از هم جدا کنید.\n\nمثال: موفقیت, بازاریابی, ارز دیجیتال, فروش آنلاین"
     MSG_KEYWORDS_SET = "✅ کلمات کلیدی شما با موفقیت ذخیره شد."
+    MSG_PROMPT_CONVERSATION_ACCOUNTS = "🗣️ لطفاً نام مستعار حساب‌هایی که می‌خواهید در گفتگوها شرکت کنند را وارد کنید. نام‌ها را با کاما (,) از هم جدا کنید.\n\nاین حساب‌ها در گروه‌های جدید ساخته شده با یکدیگر گفتگو خواهند کرد. برای غیرفعال کردن این ویژگی، این بخش را خالی بگذارید."
+    MSG_CONVERSATION_ACCOUNTS_SET = "✅ حساب‌های گفتگو با موفقیت ذخیره شدند."
     MSG_AWAITING_APPROVAL = "⏳ درخواست دسترسی شما برای ادمین ارسال شد. لطفاً منتظر تایید بمانید."
     MSG_USER_APPROVED = "✅ درخواست شما تایید شد! برای شروع /start را بزنید."
     MSG_USER_DENIED = "❌ متاسفانه درخواست دسترسی شما رد شد."
@@ -214,6 +219,8 @@ class GroupCreatorBot:
         self.active_workers_state = self._load_active_workers_state()
         self.keywords_file = SESSIONS_DIR / "keywords.json"
         self.user_keywords = self._load_user_keywords()
+        self.conversation_accounts_file = SESSIONS_DIR / "conversation_accounts.json"
+        self.conversation_accounts = self._load_conversation_accounts()
         try:
             fernet = Fernet(ENCRYPTION_KEY.encode())
             # Initialize the session manager instance
@@ -336,6 +343,12 @@ class GroupCreatorBot:
     def _save_user_keywords(self) -> None:
         self._save_json_file(self.user_keywords, self.keywords_file)
 
+    def _load_conversation_accounts(self) -> Dict[str, List[str]]:
+        return self._load_json_file(self.conversation_accounts_file, {})
+
+    def _save_conversation_accounts(self) -> None:
+        self._save_json_file(self.conversation_accounts, self.conversation_accounts_file)
+
     def _load_known_users(self) -> List[int]:
         return self._load_json_file(self.known_users_file, [])
 
@@ -455,7 +468,7 @@ class GroupCreatorBot:
     def _build_main_menu(self) -> List[List[Button]]:
         return [
             [Button.text(Config.BTN_MANAGE_ACCOUNTS)],
-            [Button.text(Config.BTN_SET_KEYWORDS)],
+            [Button.text(Config.BTN_SET_KEYWORDS), Button.text(Config.BTN_SET_CONVERSATION_ACCOUNTS)],
             [Button.text(Config.BTN_SERVER_STATUS), Button.text(Config.BTN_HELP)],
         ]
 
@@ -516,7 +529,8 @@ class GroupCreatorBot:
             LOGGER.info(f"Attempt {attempt_num + 1}/{len(proxies_to_try)}: Using {log_proxy_info} for Gemini.")
 
             try:
-                async with httpx.AsyncClient(proxies=proxy_mount, timeout=40.0) as client:
+                async with httpx.AsyncClient(mounts=proxy_mount, timeout=40.0) as client:
+
                     response = await client.post(api_url, json=payload, headers=headers)
                     response.raise_for_status()
                     data = response.json()
@@ -554,57 +568,100 @@ class GroupCreatorBot:
 
         return [] # Return empty list if all attempts fail
 
-    async def _simulate_conversation(self, user_id: int, group_id: int):
-        user_accounts = self.session_manager.get_user_accounts(user_id)
-        if len(user_accounts) < 2:
-            LOGGER.warning(f"Cannot simulate conversation for user {user_id}, not enough accounts ({len(user_accounts)}).")
+    async def _simulate_conversation(self, user_id: int, group_id: int, creator_client: Optional[TelegramClient] = None, creator_account_name: Optional[str] = None):
+        """Simulates a conversation in a group with pre-configured accounts."""
+        participant_names = self.conversation_accounts.get(str(user_id), [])
+        if not participant_names:
+            LOGGER.info(f"Skipping conversation for group {group_id}: No participants configured.")
             return
 
-        LOGGER.info(f"Starting conversation simulation in group {group_id} with {len(user_accounts)} accounts.")
-        clients = []
-        for acc_name in user_accounts:
-            session_str = self.session_manager.load_session_string(user_id, acc_name)
-            proxy = self.account_proxies.get(f"{user_id}:{acc_name}")
-            client = await self._create_worker_client(session_str, proxy)
-            if client:
-                try:
-                    await client(InviteToChannelRequest(channel=group_id, users=[await client.get_me()]))
-                    clients.append(client)
-                    LOGGER.info(f"Account '{acc_name}' successfully joined group {group_id}.")
-                    await asyncio.sleep(random.uniform(1, 3))
-                except Exception as e:
-                    LOGGER.error(f"Account '{acc_name}' failed to join group {group_id}: {e}")
-                    if client.is_connected():
-                        await client.disconnect()
+        local_creator_client = creator_client
+        temp_creator_to_disconnect = None
 
-        if len(clients) < 2:
-            LOGGER.warning(f"Not enough clients successfully joined the group to simulate conversation.")
-            for client in clients:
-                if client.is_connected():
-                    await client.disconnect()
-            return
+        # If called by scheduler, a creator client needs to be temporarily established.
+        if not local_creator_client:
+            if creator_account_name is None:
+                creator_account_name = participant_names[0]
 
-        try:
-            chat_messages = await self._generate_persian_messages(user_id)
-            if not chat_messages:
-                LOGGER.warning("Failed to generate messages for conversation simulation.")
+            session_str = self.session_manager.load_session_string(user_id, creator_account_name)
+            if not session_str:
+                LOGGER.error(f"Scheduler: Could not load session for initiator '{creator_account_name}'.")
                 return
+            proxy = self.account_proxies.get(f"{user_id}:{creator_account_name}")
+            local_creator_client = await self._create_worker_client(session_str, proxy)
+            if not local_creator_client:
+                LOGGER.error(f"Scheduler: Could not create client for initiator '{creator_account_name}'.")
+                return
+            temp_creator_to_disconnect = local_creator_client
 
-            for i in range(10):
-                sender_client = random.choice(clients)
-                message_text = random.choice(chat_messages)
+        # Accounts that will participate in the chat
+        all_chatting_clients = [local_creator_client]
+        temp_clients_to_disconnect = []
+        other_participant_names = [name for name in participant_names if name != creator_account_name]
+
+        if other_participant_names:
+            users_to_invite = []
+            for acc_name in other_participant_names:
+                session_str = self.session_manager.load_session_string(user_id, acc_name)
+                if not session_str:
+                    LOGGER.error(f"Could not load session for participant '{acc_name}'. Skipping.")
+                    continue
+                proxy = self.account_proxies.get(f"{user_id}:{acc_name}")
+                client = await self._create_worker_client(session_str, proxy)
+                if client:
+                    try:
+                        me = await client.get_me()
+                        users_to_invite.append(me)
+                        all_chatting_clients.append(client)
+                        temp_clients_to_disconnect.append(client)
+                    except Exception as e:
+                        LOGGER.error(f"Failed to initialize client for '{acc_name}': {e}. Disconnecting.")
+                        if client.is_connected(): await client.disconnect()
+
+            if users_to_invite:
                 try:
-                    await sender_client.send_message(group_id, message_text)
-                    me = await sender_client.get_me()
-                    LOGGER.info(f"Account '{me.first_name}' sent message {i+1}/10 to group {group_id}.")
+                    LOGGER.info(f"Initiator '{creator_account_name}' is inviting {len(users_to_invite)} users to group {group_id}.")
+                    await self._send_request_with_reconnect(
+                        local_creator_client, InviteToChannelRequest(channel=group_id, users=users_to_invite), creator_account_name
+                    )
+                    await asyncio.sleep(random.uniform(2, 5))
                 except Exception as e:
-                    LOGGER.error(f"Failed to send simulation message to {group_id}: {e}")
-                await asyncio.sleep(random.uniform(10, 30))
-        finally:
-            LOGGER.info(f"Conversation simulation finished for group {group_id}. Disconnecting clients.")
-            for client in clients:
-                if client.is_connected():
-                    await client.disconnect()
+                    LOGGER.error(f"Initiator '{creator_account_name}' failed to invite users to group {group_id}: {e}")
+
+        if len(all_chatting_clients) < 2:
+            LOGGER.warning(f"Not enough clients ({len(all_chatting_clients)}) available to simulate conversation in group {group_id}.")
+        else:
+            try:
+                chat_messages = await self._generate_persian_messages(user_id)
+                if not chat_messages:
+                    LOGGER.warning("Failed to generate messages for conversation simulation.")
+                else:
+                    LOGGER.info(f"Starting conversation with {len(all_chatting_clients)} accounts in group {group_id}.")
+                    for i in range(min(10, len(chat_messages))):
+                        sender_client = random.choice(all_chatting_clients)
+                        message_text = random.choice(chat_messages)
+                        chat_messages.remove(message_text)
+
+                        sender_me = await sender_client.get_me()
+                        sender_name = sender_me.first_name or sender_me.username or f"ID:{sender_me.id}"
+                        try:
+                            await self._send_request_with_reconnect(
+                                sender_client, functions.messages.SendMessageRequest(peer=group_id, message=message_text, no_webpage=True), sender_name
+                            )
+                            LOGGER.info(f"Account '{sender_name}' sent message {i+1}/10 to group {group_id}.")
+                        except Exception as e:
+                            LOGGER.error(f"Account '{sender_name}' failed to send simulation message to {group_id}: {e}")
+                        await asyncio.sleep(random.uniform(10, 30))
+            except Exception as e:
+                LOGGER.error(f"Unexpected error during conversation simulation: {e}", exc_info=True)
+
+        # Final cleanup
+        LOGGER.info(f"Conversation simulation finished for group {group_id}. Disconnecting temp clients.")
+        for client in temp_clients_to_disconnect:
+            if client.is_connected():
+                await client.disconnect()
+        if temp_creator_to_disconnect and temp_creator_to_disconnect.is_connected():
+            await temp_creator_to_disconnect.disconnect()
 
     # --- Main Worker Task ---
     async def run_group_creation_worker(self, user_id: int, account_name: str, user_client: TelegramClient) -> None:
@@ -632,7 +689,9 @@ class GroupCreatorBot:
                         group_id_str = str(new_supergroup.id)
                         self.created_groups[group_id_str] = {"owner_id": user_id, "last_simulated": 0}
                         self._save_created_groups()
-                        await self._simulate_conversation(user_id, new_supergroup.id)
+
+                        await self._simulate_conversation(user_id, new_supergroup.id, user_client, account_name)
+
                         self._set_group_count(worker_key, current_semester)
                         groups_made = i + 1
                         groups_remaining = Config.GROUPS_TO_CREATE - groups_made
@@ -748,6 +807,17 @@ class GroupCreatorBot:
         self.user_sessions[user_id]['state'] = 'awaiting_keywords'
         await event.reply(Config.MSG_PROMPT_KEYWORDS, buttons=[[Button.text(Config.BTN_BACK)]])
 
+    async def _set_conv_accs_handler(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        self.user_sessions[user_id]['state'] = 'awaiting_conv_accounts'
+        user_accounts = self.session_manager.get_user_accounts(user_id)
+        if user_accounts:
+            accounts_list_str = "\n".join(f"- `{acc}`" for acc in user_accounts)
+            prompt_message = f"{Config.MSG_PROMPT_CONVERSATION_ACCOUNTS}\n\n**حساب‌های موجود شما:**\n{accounts_list_str}"
+        else:
+            prompt_message = f"{Config.MSG_PROMPT_CONVERSATION_ACCOUNTS}\n\n**شما هنوز حسابی اضافه نکرده‌اید.**"
+        await event.reply(prompt_message, buttons=[[Button.text(Config.BTN_BACK)]])
+
     async def _admin_command_handler(self, event: events.NewMessage.Event, handler: callable):
         if event.sender_id != ADMIN_USER_ID:
             await event.reply("❌ You are not authorized to use this command.")
@@ -838,9 +908,11 @@ class GroupCreatorBot:
         self.user_keywords.clear()
         self.pending_users.clear()
         self.created_groups.clear()
+        self.conversation_accounts.clear()
         self._save_user_keywords()
         self._save_pending_users()
         self._save_created_groups()
+        self._save_conversation_accounts()
         report.append(f"🗑️ **Deleted Data Files:** {deleted_files_count} files\n")
         LOGGER.info(f"Deleted {deleted_files_count} data files from {SESSIONS_DIR}.")
         folders_to_clean = ["selenium_sessions", "api_sessions", "telethon_sessions"]
@@ -888,9 +960,22 @@ class GroupCreatorBot:
             return
         session = self.user_sessions.get(user_id, {})
         state = session.get('state')
+
+        # Handle back button first for states that go to the main menu
+        if text == Config.BTN_BACK and state in ['awaiting_keywords', 'awaiting_conv_accounts']:
+            self.user_sessions[user_id]['state'] = 'authenticated'
+            await self._start_handler(event)
+            return
+
+        # State-specific input handlers
         if state == 'awaiting_keywords':
             await self._handle_keywords_input(event)
             return
+        if state == 'awaiting_conv_accounts':
+            await self._handle_conv_accounts_input(event)
+            return
+
+        # Login flow has its own back button logic
         login_flow_states = ['awaiting_phone', 'awaiting_code', 'awaiting_password', 'awaiting_account_name']
         if state in login_flow_states:
             if text == Config.BTN_BACK:
@@ -905,9 +990,11 @@ class GroupCreatorBot:
             }
             await state_map[state](event)
             return
+
         if state != 'authenticated':
             await self._start_handler(event)
             return
+
         admin_routes = {
             "/debug_proxies": self._debug_test_proxies_handler,
             "/clean_sessions": self._clean_sessions_handler,
@@ -916,6 +1003,7 @@ class GroupCreatorBot:
         if text in admin_routes:
             await self._admin_command_handler(event, admin_routes[text])
             return
+
         route_map = {
             Config.BTN_MANAGE_ACCOUNTS: self._manage_accounts_handler,
             Config.BTN_HELP: self._help_handler,
@@ -924,19 +1012,23 @@ class GroupCreatorBot:
             Config.BTN_ADD_ACCOUNT_SELENIUM: self._initiate_selenium_login_flow,
             Config.BTN_SERVER_STATUS: self._server_status_handler,
             Config.BTN_SET_KEYWORDS: self._set_keywords_handler,
+            Config.BTN_SET_CONVERSATION_ACCOUNTS: self._set_conv_accs_handler,
         }
         handler = route_map.get(text)
         if handler:
             await handler(event)
             return
+
         start_match = re.match(rf"{re.escape(Config.BTN_START_PREFIX)} (.*)", text)
         if start_match:
             await self._start_process_handler(event, start_match.group(1))
             return
+
         stop_match = re.match(rf"{re.escape(Config.BTN_STOP_PREFIX)} (.*)", text)
         if stop_match:
             await self._cancel_worker_handler(event, stop_match.group(1))
             return
+
         delete_match = re.match(rf"{re.escape(Config.BTN_DELETE_PREFIX)} (.*)", text)
         if delete_match:
             await self._delete_account_handler(event, delete_match.group(1))
@@ -1049,6 +1141,31 @@ class GroupCreatorBot:
             await event.reply(Config.MSG_KEYWORDS_SET, buttons=self._build_main_menu())
         else:
             await event.reply("❌ ورودی نامعتبر است. لطفاً حداقل یک کلمه کلیدی وارد کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+        self.user_sessions[event.sender_id]['state'] = 'authenticated'
+        raise events.StopPropagation
+
+    async def _handle_conv_accounts_input(self, event: events.NewMessage.Event) -> None:
+        user_id = str(event.sender_id)
+        input_text = event.message.text.strip()
+
+        if not input_text:
+            self.conversation_accounts[user_id] = []
+            self._save_conversation_accounts()
+            await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
+            self.user_sessions[event.sender_id]['state'] = 'authenticated'
+            raise events.StopPropagation
+
+        all_user_accounts = self.session_manager.get_user_accounts(int(user_id))
+        provided_accounts = [acc.strip() for acc in input_text.split(',')]
+        invalid_accounts = [acc for acc in provided_accounts if acc not in all_user_accounts]
+
+        if invalid_accounts:
+            await event.reply(f"❌ حساب‌های زیر یافت نشدند یا متعلق به شما نیستند: `{'`, `'.join(invalid_accounts)}`\n\nلطفاً دوباره تلاش کنید.", buttons=[[Button.text(Config.BTN_BACK)]])
+            return
+
+        self.conversation_accounts[user_id] = provided_accounts
+        self._save_conversation_accounts()
+        await event.reply(Config.MSG_CONVERSATION_ACCOUNTS_SET, buttons=self._build_main_menu())
         self.user_sessions[event.sender_id]['state'] = 'authenticated'
         raise events.StopPropagation
 
